@@ -1,18 +1,28 @@
-# main_fixed.py - Traductor en Tiempo Real con IA
-import os, asyncio, json, base64
+# main.py - Traductor en Tiempo Real con IA - OPTIMIZADO PARA BAJA LATENCIA
+import os
+import sys
+import asyncio
+import json
+import base64
 import sounddevice as sd
 import numpy as np
 import websockets
 import deepl
 import webrtcvad
 from collections import deque
-import config  # Importar configuración
-import requests  # Para ElevenLabs REST API
+import config
+
+# Configurar salida UTF-8 para emojis en Windows
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except:
+        pass
 
 ### ========== CONFIGURACIÓN ==========
 SAMPLE_RATE = config.SAMPLE_RATE
 CHANNELS = config.CHANNELS
-BLOCK_MS = config.BLOCK_SIZE_MS
+BLOCK_MS = 20  # 20ms para menor latencia (WebRTC VAD óptimo)
 BLOCK_SAMPLES = SAMPLE_RATE * BLOCK_MS // 1000
 
 # Nombres de dispositivos
@@ -48,240 +58,297 @@ def find_device(name_hint: str, kind: str):
     
     raise RuntimeError(f"❌ No se encontró dispositivo {kind} con nombre: {name_hint}")
 
-### ========== TRADUCCIÓN ==========
+### ========== TRADUCCIÓN ASÍNCRONA ==========
 translator = deepl.Translator(DEEPL_KEY)
 
-def translate_text(text: str, target: str):
-    """Traduce texto. target: 'EN-US' o 'ES'"""
+async def translate_text_async(text: str, target: str):
+    """Traduce texto de forma asíncrona (no bloquea event loop). target: 'EN-US' o 'ES'"""
     if not text.strip():
         return ""
     try:
-        result = translator.translate_text(text, target_lang=target)
+        loop = asyncio.get_event_loop()
+        # Ejecutar en thread pool para no bloquear
+        result = await loop.run_in_executor(
+            None,
+            lambda: translator.translate_text(text, target_lang=target)
+        )
         return result.text
     except Exception as e:
         print(f"❌ Error traduciendo: {e}")
         return ""
 
-### ========== SPEECH-TO-TEXT (Deepgram) ==========
+### ========== SPEECH-TO-TEXT (Deepgram nova-3 con emisión incremental) ==========
 async def deepgram_stt(audio_queue: asyncio.Queue, lang: str, text_queue: asyncio.Queue):
     """
-    Conecta a Deepgram WebSocket para transcribir audio con reconexión automática.
+    Streaming STT con Deepgram (nova-3) + endpointing corto + emisión incremental.
     lang: 'es' o 'en'
     """
+    # Usar en-US para inglés y es para español
+    language = "en-US" if lang.startswith("en") else "es"
+    
+    # Configuración básica compatible con todos los planes
     uri = (
-        f"wss://api.deepgram.com/v1/listen"
-        f"?model=nova-2&language={lang}"
-        f"&encoding=linear16&sample_rate={SAMPLE_RATE}"
-        f"&channels={CHANNELS}&punctuate=true"
-        f"&interim_results=true&endpointing=1200"
-        f"&utterance_end_ms=2500&vad_events=true"
+        "wss://api.deepgram.com/v1/listen"
+        f"?language={language}"
+        f"&encoding=linear16"
+        f"&sample_rate=16000"
+        f"&punctuate=true"
+        f"&interim_results=true"
     )
     headers = {"Authorization": f"Token {DG_KEY}"}
     
-    reconnect_count = 0
-    max_reconnects = 999  # Reconexiones infinitas
-    
-    while reconnect_count < max_reconnects:
+    reconnects = 0
+    while True:
         try:
-            if reconnect_count > 0:
-                print(f"🔄 [{lang.upper()}] Reconectando a Deepgram (intento {reconnect_count})...")
-                await asyncio.sleep(2)  # Esperar antes de reconectar
+            if reconnects:
+                await asyncio.sleep(min(2 + reconnects * 0.5, 5))
             else:
-                print(f"🎤 [{lang.upper()}] Conectando a Deepgram...")
+                print(f"🎤 [{language}] Conectando a Deepgram...")
             
             async with websockets.connect(uri, additional_headers=headers, ping_interval=20) as ws:
-                print(f"✅ [{lang.upper()}] Deepgram conectado")
-                reconnect_count = 0  # Resetear contador al conectar exitosamente
+                print(f"✅ [{language}] Deepgram conectado (nova-3)")
+                reconnects = 0
                 
+                # --- Emisor de audio ---
                 async def send_audio():
-                    """Envía audio desde la cola al WebSocket"""
+                    while True:
+                        chunk = await audio_queue.get()
+                        if chunk is None:
+                            break
+                        await ws.send(chunk)
+                        # Sin sleep artificial - dejamos que WS module backpressure
+                    # Si cortamos manualmente, finalizamos
                     try:
-                        sent_count = 0
-                        while True:
-                            chunk = await audio_queue.get()
-                            if chunk is None:
-                                break
-                            await ws.send(chunk)
-                            sent_count += 1
-                            if sent_count % 200 == 0:  # Reducido: log cada 200 bloques (~6 segundos)
-                                print(f"🎵 [{lang.upper()}] Enviados {sent_count} bloques a Deepgram...")
-                            await asyncio.sleep(0.001)  # Pequeña pausa
-                    except Exception as e:
-                        print(f"⚠️ [{lang.upper()}] Conexión cerrada (audio): {e}")
-                    finally:
-                        try:
-                            await ws.send(json.dumps({"type": "CloseStream"}))
-                        except:
-                            pass
+                        await ws.send(json.dumps({"type": "Finalize"}))
+                    except:
+                        pass
                 
+                # --- Receptor de textos (HÍBRIDO: finales + incrementales con puntuación) ---
                 async def receive_text():
-                    """Recibe transcripciones del WebSocket"""
-                    last_transcript = ""
-                    last_update_time = asyncio.get_event_loop().time()
-                    silence_threshold = 2.0  # 2 segundos de silencio antes de enviar
-                    last_sent_transcript = ""  # Última transcripción enviada para evitar duplicados
+                    last_emitted_text = ""   # último texto emitido completo
+                    last_emit_t = asyncio.get_event_loop().time()
+                    EMIT_TIMEOUT = 1.5  # Emitir cada 1.5s para evitar timeout de ElevenLabs
                     
-                    async def check_silence():
-                        """Verifica si hay suficiente silencio para enviar la transcripción"""
-                        nonlocal last_transcript, last_update_time, last_sent_transcript
-                        while True:
-                            await asyncio.sleep(0.3)  # Verificar cada 0.3s
-                            current_time = asyncio.get_event_loop().time()
-                            time_since_update = current_time - last_update_time
-                            
-                            if last_transcript and time_since_update >= silence_threshold:
-                                # Han pasado 2 segundos sin actualización, enviar
-                                if last_transcript != last_sent_transcript:  # Solo si es diferente
-                                    print(f"📝 [{lang.upper()}] ✅ COMPLETA: {last_transcript}")
-                                    try:
-                                        await text_queue.put(last_transcript)
-                                        last_sent_transcript = last_transcript  # Marcar como enviada
-                                    except:
-                                        pass
-                                # Limpiar para la siguiente transcripción
-                                last_transcript = ""
-                                last_update_time = current_time
+                    async for msg in ws:
+                        try:
+                            data = json.loads(msg)
+                        except:
+                            continue
+                        
+                        # Mensajes "Results" con transcripción
+                        ch = data.get("channel")
+                        if not isinstance(ch, dict):
+                            continue
+                        alts = ch.get("alternatives", [])
+                        if not alts:
+                            continue
+                        
+                        transcript = alts[0].get("transcript", "") or ""
+                        is_final = data.get("is_final") or data.get("speech_final")
+                        
+                        now = asyncio.get_event_loop().time()
+                        
+                        # SOLO emitir cuando es FINAL (evita repeticiones)
+                        if is_final:
+                            text = transcript.strip()
+                            if text:
+                                # Verificar si es realmente nuevo contenido
+                                # (no está contenido en el último texto ni es idéntico)
+                                is_duplicate = (
+                                    text == last_emitted_text or
+                                    text in last_emitted_text or
+                                    last_emitted_text in text and len(text) - len(last_emitted_text) < 3
+                                )
+                                
+                                if not is_duplicate:
+                                    print(f"📝 [{language}] ✅ FINAL: {text}")
+                                    await text_queue.put(text)
+                                    last_emitted_text = text
+                                else:
+                                    print(f"⏭️ [{language}] Fragmento ignorado (ya emitido): '{text}'")
+                        else:
+                            # Mostrar progreso pero NO emitir (solo FINALES)
+                            if transcript:
+                                print(f"� [{language}] Escuchando: {transcript}", end="\r")
                     
-                    # Iniciar tarea de verificación de silencio
-                    silence_task = asyncio.create_task(check_silence())
-                    
-                    try:
-                        async for msg in ws:
-                            try:
-                                data = json.loads(msg)
-                                # Deepgram puede enviar varios tipos de mensajes
-                                if "channel" in data:
-                                    channel = data.get("channel")
-                                    if isinstance(channel, dict):
-                                        alternatives = channel.get("alternatives", [])
-                                        if alternatives and len(alternatives) > 0:
-                                            transcript = alternatives[0].get("transcript", "")
-                                            
-                                            # Limpiar duplicados: "Hello. Hello. Hello." → "Hello."
-                                            if transcript.strip():
-                                                # Dividir en frases
-                                                sentences = [s.strip() for s in transcript.split('.') if s.strip()]
-                                                # Eliminar duplicados consecutivos
-                                                unique_sentences = []
-                                                last_sentence = ""
-                                                for sentence in sentences:
-                                                    if sentence.lower() != last_sentence.lower():
-                                                        unique_sentences.append(sentence)
-                                                        last_sentence = sentence
-                                                # Reconstruir
-                                                cleaned_transcript = '. '.join(unique_sentences)
-                                                if cleaned_transcript and not cleaned_transcript.endswith('.'):
-                                                    cleaned_transcript += '.'
-                                                
-                                                # Actualizar transcripción solo si es más larga
-                                                if cleaned_transcript and len(cleaned_transcript) > len(last_transcript):
-                                                    last_transcript = cleaned_transcript
-                                                    last_update_time = asyncio.get_event_loop().time()
-                                                    print(f"📝 [{lang.upper()}] ... {cleaned_transcript}")
-                            except json.JSONDecodeError:
-                                continue
-                            except Exception as e:
-                                print(f"⚠️ [{lang.upper()}] Error procesando mensaje: {e}")
-                    except Exception as e:
-                        silence_task.cancel()
-                        print(f"⚠️ [{lang.upper()}] Conexión cerrada (texto): {e}")
-                        # Enviar última transcripción si existe y no se envió antes
-                        if last_transcript and last_transcript != last_sent_transcript:
-                            print(f"📝 [{lang.upper()}] ⚠️ Usando última transcripción: {last_transcript}")
-                            try:
-                                await text_queue.put(last_transcript)
-                            except:
-                                pass
-                
                 await asyncio.gather(send_audio(), receive_text())
                 
         except Exception as e:
-            reconnect_count += 1
-            print(f"⚠️ [{lang.upper()}] Deepgram desconectado. Reconectando en 2s...")
-            await asyncio.sleep(2)
+            reconnects += 1
+            print(f"⚠️ [{language}] Deepgram desconectado: {e}. Reconectando...")
+            continue
 
-### ========== TEXT-TO-SPEECH (ElevenLabs REST API - SIMPLE Y CONFIABLE) ==========
-def synthesize_speech_rest(text: str) -> bytes:
-    """Sintetiza voz usando ElevenLabs REST API - Devuelve PCM directamente"""
-    # Usar output_format=pcm_16000 para recibir PCM directamente
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}?output_format=pcm_16000"
-    headers = {
-        "Accept": "audio/pcm",
-        "Content-Type": "application/json",
-        "xi-api-key": ELEVEN_KEY
-    }
-    data = {
-        "text": text,
-        "model_id": "eleven_turbo_v2_5",
-        "voice_settings": {
-            "stability": config.VOICE_STABILITY,
-            "similarity_boost": config.VOICE_SIMILARITY
-        }
-    }
-    
-    try:
-        print(f"📡 Llamando ElevenLabs REST API...")
-        response = requests.post(url, json=data, headers=headers, timeout=30)
-        response.raise_for_status()
-        audio_bytes = response.content
-        print(f"✅ Recibidos {len(audio_bytes)} bytes de audio PCM")
-        return audio_bytes
-    except Exception as e:
-        print(f"⚠️ Error en REST API: {e}")
-        return b""
-
-async def elevenlabs_tts(text_queue: asyncio.Queue, output_device: int, lang_label: str):
-    """Sintetiza voz usando REST API y la reproduce"""
-    stream = sd.RawOutputStream(
-        samplerate=16000,
-        channels=1,
-        dtype='int16',
-        device=output_device,
-        blocksize=BLOCK_SAMPLES
+### ========== TEXT-TO-SPEECH (ElevenLabs WebSocket STREAMING - LATENCIA MÍNIMA) ==========
+async def elevenlabs_tts_stream(text_queue: asyncio.Queue, output_device: int, lang_label: str):
+    """
+    TTS por WebSocket streaming (PCM 16 kHz) para latencia mínima.
+    Mantiene la conexión abierta y reproduce a medida que llegan los trozos.
+    """
+    ws_url = (
+        f"wss://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE_ID}/stream-input"
+        "?model_id=eleven_turbo_v2_5&output_format=pcm_16000"  # PCM 16kHz
     )
-    stream.start()
-    print(f"🔊 [{lang_label}] TTS REST iniciado")
+    # Usar additional_headers (compatible con versión antigua de websockets)
+    headers = {"xi-api-key": ELEVEN_KEY}
     
-    try:
-        while True:
-            text = await text_queue.get()
-            if text is None:
+    # Buffer para deduplicación de texto (evitar enviar repetidos)
+    last_sent_text = ""  # Último texto enviado
+    
+    # Intentar diferentes configuraciones de latencia (de más a menos óptima)
+    stream = None
+    audio_configs = [
+        {"name": "WASAPI exclusivo", "latency": "low", "exclusive": True},
+        {"name": "WASAPI compartido", "latency": "low", "exclusive": False},
+        {"name": "Latencia baja", "latency": "low", "exclusive": None},
+        {"name": "Latencia normal", "latency": None, "exclusive": None},
+    ]
+    
+    for audio_config in audio_configs:
+        try:
+            # Configurar extra_settings si aplica
+            extra = None
+            if audio_config["exclusive"] is not None:
+                try:
+                    from sounddevice import WasapiSettings
+                    extra = WasapiSettings(exclusive=audio_config["exclusive"])
+                except:
+                    continue
+            
+            # Intentar abrir el stream
+            stream_params = {
+                "samplerate": 16000,  # Coincidir con formato de ElevenLabs
+                "channels": 1,
+                "dtype": "int16",
+                "device": output_device,
+                "blocksize": BLOCK_SAMPLES
+            }
+            if audio_config["latency"]:
+                stream_params["latency"] = audio_config["latency"]
+            if extra:
+                stream_params["extra_settings"] = extra
+            
+            stream = sd.RawOutputStream(**stream_params)
+            stream.start()
+            print(f"🔊 [{lang_label}] TTS WebSocket iniciado ({audio_config['name']})")
+            break  # Éxito!
+        except Exception as e:
+            if audio_config == audio_configs[-1]:  # Último intento
+                raise RuntimeError(f"No se pudo iniciar salida de audio: {e}")
+            continue  # Intentar siguiente configuración
+    
+    if not stream:
+        raise RuntimeError(f"No se pudo iniciar TTS stream para {lang_label}")
+    
+    reconnects = 0
+    while True:
+        try:
+            if reconnects:
+                await asyncio.sleep(min(2 + reconnects * 0.5, 5))
+            
+            async with websockets.connect(ws_url, additional_headers=headers, ping_interval=20) as ws:
+                print(f"✅ [{lang_label}] ElevenLabs WS conectado")
+                reconnects = 0
+                
+                # Warmup inicial con configuración (según docs de ElevenLabs)
+                init = {
+                    "text": " ",
+                    "voice_settings": {
+                        "stability": config.VOICE_STABILITY,
+                        "similarity_boost": config.VOICE_SIMILARITY,
+                        "use_speaker_boost": False
+                    },
+                    "generation_config": {
+                        "chunk_length_schedule": [50, 120, 160, 250]  # Baja latencia
+                    },
+                    "xi_api_key": ELEVEN_KEY
+                }
+                await ws.send(json.dumps(init))
+                
+                async def sender():
+                    nonlocal last_sent_text
+                    while True:
+                        text = await text_queue.get()
+                        if text is None:
+                            # Solo salir del loop, NO cerrar WS (keepalive lo mantiene vivo)
+                            break
+                        
+                        # Deduplicación inteligente: detectar duplicados y fragmentos
+                        text_clean = text.strip()
+                        if text_clean:
+                            # Solo bloquear duplicados EXACTOS (menos agresivo)
+                            is_duplicate = text_clean.lower() == last_sent_text.lower()
+                            
+                            if not is_duplicate:
+                                last_sent_text = text_clean
+                                print(f"🗣️ [{lang_label}] ⚡ Enviando: {text}")
+                                # Enviar con flush: true para generar inmediatamente
+                                await ws.send(json.dumps({
+                                    "text": text,
+                                    "flush": True  # Forzar generación inmediata
+                                }))
+                            else:
+                                print(f"⏭️ [{lang_label}] ⏸️ Duplicado exacto omitido: '{text_clean}'")
+                
+                async def keepalive():
+                    """Mantiene la conexión activa enviando espacios cada 15s"""
+                    try:
+                        while True:
+                            await asyncio.sleep(15)  # Cada 15 segundos
+                            # Enviar espacio para mantener conexión (según docs)
+                            await ws.send(json.dumps({"text": " "}))
+                            print(f"💓 [{lang_label}] Keepalive enviado")
+                    except asyncio.CancelledError:
+                        pass
+                
+                async def receiver():
+                    first_chunk = True
+                    chunk_count = 0
+                    async for raw in ws:
+                        try:
+                            data = json.loads(raw)
+                        except Exception as e:
+                            print(f"⚠️ [{lang_label}] Error parseando respuesta: {e}")
+                            continue
+                        
+                        # Debug: ver qué llega
+                        if "audio" not in data and "error" in data:
+                            print(f"❌ [{lang_label}] Error de ElevenLabs: {data.get('error')}")
+                        
+                        audio_b64 = data.get("audio")
+                        if audio_b64:
+                            chunk_count += 1
+                            pcm = base64.b64decode(audio_b64)
+                            if first_chunk:
+                                print(f"🔊 [{lang_label}] ⚡ PRIMERA SÍLABA reproducida!")
+                                first_chunk = False
+                            stream.write(pcm)
+                            # Debug: mostrar progreso cada 5 chunks
+                            if chunk_count % 5 == 0:
+                                print(f"🎵 [{lang_label}] Reproduciendo chunk {chunk_count}...")
+                        
+                        # Verificar si es el último chunk
+                        if data.get("isFinal"):
+                            print(f"✅ [{lang_label}] Síntesis completada ({chunk_count} chunks)")
+                            first_chunk = True  # Resetear para próximo mensaje
+                            chunk_count = 0
+                
+                await asyncio.gather(sender(), receiver(), keepalive())
+                
+        except Exception as e:
+            reconnects += 1
+            print(f"⚠️ [{lang_label}] TTS WS desconectado: {e}. Reconectando...")
+            if reconnects > 10:
+                print(f"❌ [{lang_label}] Demasiados fallos de reconexión. Abortando.")
                 break
-            
-            print(f"🗣️ [{lang_label}] Sintetizando: {text}")
-            
-            # Ejecutar síntesis en thread pool (no bloquear asyncio)
-            loop = asyncio.get_event_loop()
-            audio_pcm = await loop.run_in_executor(None, synthesize_speech_rest, text)
-            
-            if not audio_pcm:
-                print(f"⚠️ [{lang_label}] No se recibió audio")
-                continue
-            
-            try:
-                print(f"🔊 [{lang_label}] Reproduciendo {len(audio_pcm)} bytes")
-                
-                # Silencio previo (500ms)
-                pre_silence = np.zeros(int(16000 * 0.5), dtype=np.int16)
-                stream.write(pre_silence.tobytes())
-                
-                # AUDIO COMPLETO de una vez
-                stream.write(audio_pcm)
-                
-                # Silencio posterior (2 segundos para asegurar)
-                post_silence = np.zeros(int(16000 * 2.0), dtype=np.int16)
-                stream.write(post_silence.tobytes())
-                
-                print(f"✅ [{lang_label}] Reproducción completada (500ms + {len(audio_pcm)}B + 2000ms)")
-                
-            except Exception as e:
-                print(f"⚠️ [{lang_label}] Error reproduciendo: {e}")
-                import traceback
-                traceback.print_exc()
-                
-    finally:
-        stream.stop()
-        stream.close()
+            continue
+        finally:
+            # Si salimos del bucle, detener
+            if reconnects > 10:
+                break
+    
+    stream.stop()
+    stream.close()
+    print(f"⏹️ [{lang_label}] TTS detenido")
 
 ### ========== CAPTURA DE AUDIO CON VAD ==========
 class AudioCapture:
@@ -328,7 +395,7 @@ class AudioCapture:
         audio_bytes = bytes(indata)
         self.buffer.extend(audio_bytes)
         
-        # Procesar en bloques de 30ms
+        # Procesar en bloques de 20ms
         while len(self.buffer) >= BLOCK_SAMPLES * 2:
             chunk = bytes(self.buffer[:BLOCK_SAMPLES * 2])
             self.buffer = self.buffer[BLOCK_SAMPLES * 2:]
@@ -347,13 +414,13 @@ class AudioCapture:
                     if self.loop and self.loop.is_running():
                         self._safe_put_audio(chunk)
                         self.sent_chunks += 1
-                        if self.sent_chunks % 100 == 0:  # Reducido: log cada 100 bloques (~3s)
+                        if self.sent_chunks % 100 == 0:  # Log cada 100 bloques (~2s con 20ms)
                             print(f"🎵 [{self.name}] Enviados {self.sent_chunks} bloques de audio a la cola")
                 else:
                     if self.is_speaking:
                         self.silence_frames += 1
                         # Enviar algunos frames de silencio después de hablar
-                        if self.silence_frames < 30:  # ~900ms de silencio (aumentado)
+                        if self.silence_frames < 30:  # ~600ms de silencio
                             if self.loop and self.loop.is_running():
                                 self._safe_put_audio(chunk)
                                 self.sent_chunks += 1
@@ -365,17 +432,48 @@ class AudioCapture:
                 print(f"❌ [{self.name}] Error VAD: {e}")
     
     def start(self):
-        """Inicia la captura de audio"""
-        self.stream = sd.RawInputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype='int16',
-            device=self.device_idx,
-            blocksize=BLOCK_SAMPLES,
-            callback=self.callback
-        )
-        self.stream.start()
-        print(f"🎤 [{self.name}] Captura iniciada")
+        """Inicia la captura de audio con latencia baja"""
+        # Intentar diferentes configuraciones de latencia (de más a menos óptima)
+        audio_configs = [
+            {"name": "WASAPI exclusivo", "latency": "low", "exclusive": True},
+            {"name": "WASAPI compartido", "latency": "low", "exclusive": False},
+            {"name": "Latencia baja", "latency": "low", "exclusive": None},
+            {"name": "Latencia normal", "latency": None, "exclusive": None},
+        ]
+        
+        for audio_config in audio_configs:
+            try:
+                # Configurar extra_settings si aplica
+                extra = None
+                if audio_config["exclusive"] is not None:
+                    try:
+                        from sounddevice import WasapiSettings
+                        extra = WasapiSettings(exclusive=audio_config["exclusive"])
+                    except:
+                        continue
+                
+                # Intentar abrir el stream
+                stream_params = {
+                    "samplerate": SAMPLE_RATE,
+                    "channels": CHANNELS,
+                    "dtype": 'int16',
+                    "device": self.device_idx,
+                    "blocksize": BLOCK_SAMPLES,
+                    "callback": self.callback
+                }
+                if audio_config["latency"]:
+                    stream_params["latency"] = audio_config["latency"]
+                if extra:
+                    stream_params["extra_settings"] = extra
+                
+                self.stream = sd.RawInputStream(**stream_params)
+                self.stream.start()
+                print(f"🎤 [{self.name}] Captura iniciada ({audio_config['name']})")
+                return  # Éxito!
+            except Exception as e:
+                if audio_config == audio_configs[-1]:  # Último intento
+                    raise RuntimeError(f"No se pudo iniciar captura de audio: {e}")
+                continue  # Intentar siguiente configuración
     
     def stop(self):
         """Detiene la captura de audio"""
@@ -389,7 +487,7 @@ async def main():
     """Pipeline principal del traductor"""
     
     print("\n" + "="*60)
-    print("🌍 TRADUCTOR EN TIEMPO REAL CON IA")
+    print("🌍 TRADUCTOR EN TIEMPO REAL CON IA - OPTIMIZADO")
     print("="*60 + "\n")
     
     # 1. Encontrar dispositivos
@@ -413,18 +511,18 @@ async def main():
     
     # 2. Crear colas de comunicación
     # TU VOZ: Español → Inglés
-    mic_audio_q = asyncio.Queue(maxsize=500)  # Aumentado para evitar QueueFull
+    mic_audio_q = asyncio.Queue(maxsize=500)
     es_text_q = asyncio.Queue(maxsize=50)
     en_tts_text_q = asyncio.Queue(maxsize=50)
     
     # VOZ DE OTROS: Inglés → Español
-    meeting_audio_q = asyncio.Queue(maxsize=500)  # Aumentado para evitar QueueFull
+    meeting_audio_q = asyncio.Queue(maxsize=500)
     en_text_q = asyncio.Queue(maxsize=50)
     es_tts_text_q = asyncio.Queue(maxsize=50)
     
     # Timestamps para cancelación de eco
-    last_en_synthesis = {'time': 0}  # Última vez que se sintetizó en inglés
-    last_es_synthesis = {'time': 0}  # Última vez que se sintetizó en español
+    last_en_synthesis = {'time': 0}
+    last_es_synthesis = {'time': 0}
     
     # 3. Iniciar captura de audio
     mic_capture = AudioCapture(mic_idx, mic_audio_q, "TU VOZ")
@@ -448,7 +546,7 @@ async def main():
                 break
             
             print(f"🔄 Traduciendo ES→EN: '{text_es}'")
-            text_en = translate_text(text_es, "EN-US")
+            text_en = await translate_text_async(text_es, "EN-US")
             if text_en:
                 print(f"✅ 🇪🇸→🇬🇧 '{text_es}' → '{text_en}'")
                 # Marcar timestamp de síntesis en inglés
@@ -466,38 +564,39 @@ async def main():
                 await es_tts_text_q.put(None)
                 break
             
-            # Verificar si este audio es eco del sistema (menos de 8 segundos desde última síntesis EN)
+            # Verificar si este audio es eco del sistema
             current_time = asyncio.get_event_loop().time()
             time_since_synthesis = current_time - last_en_synthesis['time']
             
             if time_since_synthesis < 8.0:
-                print(f"� Ignorando eco del sistema (EN): '{text_en}' ({time_since_synthesis:.1f}s desde síntesis)")
+                print(f"🔇 Ignorando eco del sistema (EN): '{text_en}' ({time_since_synthesis:.1f}s desde síntesis)")
                 continue
             
-            print(f"�🔄 Traduciendo EN→ES: '{text_en}'")
-            text_es = translate_text(text_en, "ES")
+            print(f"🔄 Traduciendo EN→ES: '{text_en}'")
+            text_es = await translate_text_async(text_en, "ES")
             if text_es:
                 print(f"✅ 🇬🇧→🇪🇸 '{text_en}' → '{text_es}'")
                 # Marcar timestamp de síntesis en español
                 last_es_synthesis['time'] = current_time
                 await es_tts_text_q.put(text_es)
             else:
-                print(f"⚠️ No se pudo traducir: '{text_en}'")    
+                print(f"⚠️ No se pudo traducir: '{text_en}'")
+    
     # 6. Lanzar todas las tareas
     print("🚀 Iniciando pipeline...\n")
     
     tasks = [
-        # STT
+        # STT con nova-3 y emisión incremental
         asyncio.create_task(deepgram_stt(mic_audio_q, "es", es_text_q)),
         asyncio.create_task(deepgram_stt(meeting_audio_q, "en", en_text_q)),
         
-        # Traducción
+        # Traducción asíncrona
         asyncio.create_task(translate_es_to_en()),
         asyncio.create_task(translate_en_to_es()),
         
-        # TTS
-        asyncio.create_task(elevenlabs_tts(en_tts_text_q, vb_input_idx, "EN→REUNIÓN")),
-        asyncio.create_task(elevenlabs_tts(es_tts_text_q, speakers_idx, "ES→TÚ")),
+        # TTS streaming WebSocket
+        asyncio.create_task(elevenlabs_tts_stream(en_tts_text_q, vb_input_idx, "EN→REUNIÓN")),
+        asyncio.create_task(elevenlabs_tts_stream(es_tts_text_q, speakers_idx, "ES→TÚ")),
     ]
     
     print("✅ Sistema activo. Habla por tu micrófono!\n")
