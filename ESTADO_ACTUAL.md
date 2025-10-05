@@ -3,6 +3,7 @@
 ## ✅ Problemas Resueltos
 
 ### 1. **WASAPI Exclusivo** ✅
+
 - **Problema:** Error `PaErrorCode -9984` al intentar modo exclusivo
 - **Solución:** Sistema de fallback automático que prueba 4 configuraciones:
   1. WASAPI exclusivo
@@ -12,16 +13,19 @@
 - **Estado:** ✅ **FUNCIONANDO** - usa "Latencia baja"
 
 ### 2. **Emojis en Terminal Windows** ✅
+
 - **Problema:** `UnicodeEncodeError` con emojis
 - **Solución:** `sys.stdout.reconfigure(encoding='utf-8')`
 - **Estado:** ✅ **FUNCIONANDO**
 
 ### 3. **ElevenLabs WebSocket** ✅
+
 - **Problema:** `extra_headers` no soportado en versión antigua de `websockets`
 - **Solución:** Cambio a `additional_headers` (compatible)
 - **Estado:** ✅ **FUNCIONANDO** - Se conecta correctamente
 
 ### 4. **Colisión de variables** ✅
+
 - **Problema:** Variable `config` sobrescribía módulo `config`
 - **Solución:** Renombrar a `audio_config`
 - **Estado:** ✅ **FUNCIONANDO**
@@ -67,6 +71,7 @@ uri = (
 ```
 
 **Quitar:**
+
 - `model=nova-2` → usar modelo predeterminado
 - `vad_events=true` → puede no estar disponible
 - `endpointing=500` → puede requerir plan superior
@@ -79,7 +84,7 @@ uri = (
 
 ### Opción 1: Verificar tu plan de Deepgram
 
-1. Ve a https://console.deepgram.com/
+1. Ve a <https://console.deepgram.com/>
 2. Verifica qué características tienes disponibles
 3. Revisa si `nova-2`, `endpointing`, `vad_events` están incluidos
 
@@ -152,6 +157,7 @@ Deberías ver:
 ### 3. Una vez funcionando
 
 Podrás incrementar características gradualmente:
+
 - Agregar `&model=nova-2`
 - Agregar `&endpointing=500` (si tu plan lo permite)
 - Agregar `&vad_events=true`
@@ -184,6 +190,7 @@ Esto es **normal** cuando Deepgram no consume el audio (porque no se conecta).
 ## ✨ Resumen
 
 ### Lo que YA funciona:
+
 1. ✅ Captura de audio optimizada (20ms)
 2. ✅ VAD (detección de voz)
 3. ✅ ElevenLabs TTS streaming
